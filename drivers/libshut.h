@@ -89,6 +89,8 @@ typedef struct shut_communication_subdriver_s {
 		int			 *fd,			/**< [in,out]	storage location for the file descriptor of the (already) opened device */
 		SHUTDevice_t		 *curDevice,		/**<    [out]	@ref SHUTDevice_t that has to be populated on success and representing the opened device */
 		char			 *device_path,		/**< [in]	pathname of the device that has to be opened */
+		int			  configuration,	/**< [in]	(currently unused) USB configuration that has to be set on the opened device:
+								 *		either a non-negative value, or one of the @ref comm_config_sv "dedicated special values". */
 		int			(*callback)		/**< [in]	@parblock
 								 * (optional) function to tell whether the opened device is accepted by the caller or not
 								 *
@@ -114,6 +116,7 @@ typedef struct shut_communication_subdriver_s {
 		int			fd			/**< [in] file descriptor of an opened device */
 	);
 	int		 (*get_report)			/** @brief Retrieve a HID report from a device.
+							 * @warning This function calls exit() on fatal errors.
 							 * @return length of the retrieved data, on success,
 							 * @return a @ref libusb_error "LIBUSB_ERROR" code, on errors. */
 	(
@@ -123,6 +126,7 @@ typedef struct shut_communication_subdriver_s {
 		int			 ReportSize		/**< [in] size of the report (*raw_buf* should be at least this size) */
 	);
 	int		 (*set_report)			/** @brief Set a HID report in a device.
+							 * @warning This function calls exit() on fatal errors.
 							 * @return the number of bytes sent to the device, on success,
 							 * @return a @ref libusb_error "LIBUSB_ERROR" code, on errors. */
 	(
@@ -132,6 +136,7 @@ typedef struct shut_communication_subdriver_s {
 		int			 ReportSize		/**< [in] size of the report (*raw_buf* should be at least this size) */
 	);
 	int		 (*get_string)			/** @brief Retrieve a string descriptor from a device.
+							 * @warning This function calls exit() on fatal errors.
 							 * @return the number of bytes read and stored in *buf*, on success,
 							 * @return a @ref libusb_error "LIBUSB_ERROR" code, on errors. */
 	(
@@ -141,6 +146,7 @@ typedef struct shut_communication_subdriver_s {
 		size_t			 buflen			/**< [in] size of *buf* */
 	);
 	int		 (*get_interrupt)		/** @brief Retrieve data from an interrupt endpoint of a device.
+							 * @warning This function calls exit() on fatal errors.
 							 * @return the number of bytes read and stored in *buf*, on success,
 							 * @return a @ref libusb_error "LIBUSB_ERROR" code, on errors. */
 	(
@@ -159,6 +165,12 @@ typedef struct shut_communication_subdriver_s {
 		void
 	);
 } shut_communication_subdriver_t;
+
+/** @brief Special values for shut_communication_subdriver_t::open()'s *configuration* argument. */
+enum comm_config_sv {
+	COMM_CONFIG_SKIP	= -2,			/**< Skip the USB configuration setting. */
+	COMM_CONFIG_RESET	= -1			/**< Try to put the device back into an 'unconfigured' state. */
+};
 
 /** @brief Actual SHUT communication subdriver. */
 extern shut_communication_subdriver_t	shut_subdriver;

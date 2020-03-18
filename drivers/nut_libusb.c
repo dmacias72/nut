@@ -37,7 +37,7 @@
  * @{ *************************************************************************/
 
 #define NUT_USB_DRIVER_NAME	"USB communication driver"			/**< @brief Name of this driver. */
-#define NUT_USB_DRIVER_VERSION	"0.39"						/**< @brief Version of this driver. */
+#define NUT_USB_DRIVER_VERSION	"0.43"						/**< @brief Version of this driver. */
 
 upsdrv_info_t	comm_upsdrv_info = {
 	NUT_USB_DRIVER_NAME,
@@ -65,6 +65,14 @@ static const int	nut_usb_if_num = 0;
  *
  * Initialisation and deinitialisation (of libusb, i.e. libusb_init() and libusb_exit(), and of other bits and pieces) are actually done only when this counter is/reaches zero. */
 static unsigned long	nut_usb_initcnt = 0;
+
+/** @brief List of available USB devices.
+ *
+ * We define this as a global, in case we can't control the exact point of exit from nut_libusb_open()
+ * (e.g. exit() called by the caller in usb_communication_subdriver_t::open()'s *callback*).
+ *
+ * Once free()'d, it shall be reset to `NULL`. */
+static libusb_device	**nut_usb_devlist = NULL;
 
 /** @brief Debug levels for upsdebugx()/upsdebug_hex() calls.
  * @todo Actually make sense out of these and/or standardise the use of debug levels in all the tree
@@ -119,6 +127,8 @@ static int	nut_usb_claim_interface(
 #endif	/* __FreeBSD__ */
 	} else {
 		upsdebugx(NUT_USB_DBG_LIBUSB, "%s: libusb_kernel_driver_active() returned %d (%s).", __func__, ret, ret ? libusb_strerror(ret) : "no driver active");
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			return ret;
 	}
 #endif	/* HAVE_LIBUSB_KERNEL_DRIVER_ACTIVE + HAVE_LIBUSB_SET_AUTO_DETACH_KERNEL_DRIVER */
 
@@ -128,6 +138,9 @@ static int	nut_usb_claim_interface(
 	while ((ret = libusb_claim_interface(udev, nut_usb_if_num)) != LIBUSB_SUCCESS) {
 
 		upsdebugx(NUT_USB_DBG_LIBUSB, "%s: failed to claim USB device (%s).", __func__, libusb_strerror(ret));
+
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			return ret;
 
 		if (retries-- == 0)
 			return ret;
@@ -139,6 +152,9 @@ static int	nut_usb_claim_interface(
 			upsdebugx(NUT_USB_DBG_LIBUSB, "%s: kernel driver already detached.", __func__);
 		else
 			upsdebugx(NUT_USB_DBG_LIBUSB, "%s: failed to detach kernel driver from USB device (%s).", __func__, libusb_strerror(ret));
+
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			return ret;
 
 	}
 #else	/* HAVE_LIBUSB_DETACH_KERNEL_DRIVER */
@@ -192,6 +208,9 @@ static int	nut_usb_set_altinterface(
 }
 
 /** @brief Log errors, if any, of nut_libusb_get_report(), nut_libusb_set_report(), nut_libusb_get_string(), nut_libusb_get_interrupt().
+ *
+ * In case of fatal errors, exit() is called.
+ *
  * @return *ret*. */
 static int	nut_usb_logerror(
 	const int	 ret,	/**< [in] a libusb return code (negative, possibly a @ref libusb_error "LIBUSB_ERROR" code, on errors) */
@@ -204,9 +223,10 @@ static int	nut_usb_logerror(
 
 	switch (ret)
 	{
+	case LIBUSB_ERROR_NO_MEM:
+		fatalx(EXIT_FAILURE, "Out of memory.");
 	case LIBUSB_ERROR_INVALID_PARAM:
 	case LIBUSB_ERROR_INTERRUPTED:
-	case LIBUSB_ERROR_NO_MEM:
 	case LIBUSB_ERROR_TIMEOUT:
 	case LIBUSB_ERROR_OVERFLOW:
 		upsdebugx(NUT_USB_DBG_LIBUSB, "%s: %s.", desc, libusb_strerror(ret));
@@ -223,6 +243,16 @@ static int	nut_usb_logerror(
 		upslogx(LOG_DEBUG, "%s: %s.", desc, libusb_strerror(ret));
 		return ret;
 	}
+}
+
+/** @brief free() @ref nut_usb_devlist (and make it `NULL`). */
+static void	nut_usb_free_devlist(void)
+{
+	if (!nut_usb_devlist)
+		return;
+
+	libusb_free_device_list(nut_usb_devlist, 1);
+	nut_usb_devlist = NULL;
 }
 
 /** @} ************************************************************************/
@@ -263,6 +293,10 @@ static void	nut_libusb_deinit(void)
 	if (--nut_usb_initcnt)
 		return;
 
+	/* free() the list of USB devices, if not already done. */
+	if (nut_usb_devlist)
+		nut_usb_free_devlist();
+
 	libusb_exit(NULL);
 }
 
@@ -271,6 +305,7 @@ static int	nut_libusb_open(
 	libusb_device_handle	**udevp,
 	USBDevice_t		 *curDevice,
 	USBDeviceMatcher_t	 *matcher,
+	int			  configuration,
 	int			(*callback)(
 		libusb_device_handle	*udev,
 		USBDevice_t		*hd,
@@ -283,7 +318,7 @@ static int	nut_libusb_open(
 	ssize_t		  devcount,
 			  devnum;
 
-	upsdebugx(NUT_USB_DBG_FUNCTION_CALLS, "%s(%p, %p, %p, %p)", __func__, (void *)udevp, (void *)curDevice, (void *)matcher, (void *)callback);
+	upsdebugx(NUT_USB_DBG_FUNCTION_CALLS, "%s(%p, %p, %p, %d, %p)", __func__, (void *)udevp, (void *)curDevice, (void *)matcher, configuration, (void *)callback);
 
 	if (!nut_usb_initcnt)
 		return LIBUSB_ERROR_OTHER;
@@ -297,9 +332,16 @@ static int	nut_libusb_open(
 		*udevp = NULL;
 	}
 
+	/* This should not happen */
+	if (nut_usb_devlist)
+		return LIBUSB_ERROR_OTHER;
+
 	devcount = libusb_get_device_list(NULL, &devlist);
 	if (devcount < 0)
 		upsdebugx(NUT_USB_DBG_DEVICE, "%s: could not get the list of USB devices (%s).", __func__, libusb_strerror(devcount));
+	if (devcount == LIBUSB_ERROR_NO_MEM)
+		fatalx(EXIT_FAILURE, "Out of memory.");
+	nut_usb_devlist = devlist;
 
 	/* Process available devices (if any) until we get a match */
 	for (devnum = 0; devnum < devcount; devnum++) {
@@ -336,6 +378,8 @@ static int	nut_libusb_open(
 
 		/* Get DEVICE descriptor */
 		ret = libusb_get_device_descriptor(device, &device_desc);
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			goto oom_error;
 		if (ret != LIBUSB_SUCCESS) {
 			upsdebugx(NUT_USB_DBG_DEVICE, "%s: unable to get DEVICE descriptor (%s).", __func__, libusb_strerror(ret));
 			continue;
@@ -343,6 +387,8 @@ static int	nut_libusb_open(
 
 		/* Open the device */
 		ret = libusb_open(device, udevp);
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			goto oom_error;
 		if (ret != LIBUSB_SUCCESS) {
 			upsdebugx(NUT_USB_DBG_DEVICE, "%s: failed to open device %04X:%04X (%s), skipping.", __func__, device_desc.idVendor, device_desc.idProduct, libusb_strerror(ret));
 			continue;
@@ -370,18 +416,24 @@ static int	nut_libusb_open(
 
 		if (device_desc.iManufacturer) {
 			ret = libusb_get_string_descriptor_ascii(udev, device_desc.iManufacturer, (unsigned char*)string, sizeof(string));
+			if (ret == LIBUSB_ERROR_NO_MEM)
+				goto oom_error;
 			if (ret > 0 && *str_trim_space(string) && (curDevice->Vendor = strdup(string)) == NULL)
 				goto oom_error;
 		}
 
 		if (device_desc.iProduct) {
 			ret = libusb_get_string_descriptor_ascii(udev, device_desc.iProduct, (unsigned char*)string, sizeof(string));
+			if (ret == LIBUSB_ERROR_NO_MEM)
+				goto oom_error;
 			if (ret > 0 && *str_trim_space(string) && (curDevice->Product = strdup(string)) == NULL)
 				goto oom_error;
 		}
 
 		if (device_desc.iSerialNumber) {
 			ret = libusb_get_string_descriptor_ascii(udev, device_desc.iSerialNumber, (unsigned char*)string, sizeof(string));
+			if (ret == LIBUSB_ERROR_NO_MEM)
+				goto oom_error;
 			if (ret > 0 && *str_trim_space(string) && (curDevice->Serial = strdup(string)) == NULL)
 				goto oom_error;
 		}
@@ -403,7 +455,7 @@ static int	nut_libusb_open(
 				goto next_device;
 			}
 			if (ret == -1) {
-				libusb_free_device_list(devlist, 1);
+				nut_usb_free_devlist();
 				fatal_with_errno(EXIT_FAILURE, "matcher");
 			}
 			if (ret == -2) {
@@ -413,21 +465,35 @@ static int	nut_libusb_open(
 		}
 		upsdebugx(NUT_USB_DBG_DEVICE, "%s: device matches.", __func__);
 
-		/* Now that we have matched the device we wanted, claim it. */
+		/* Set USB configuration, if required to do so. */
+		if (configuration == COMM_CONFIG_SKIP) {
+			upsdebugx(NUT_USB_DBG_DEVICE, "%s: skipped setting USB configuration on device.", __func__);
+		} else if ((ret = libusb_set_configuration(udev, configuration)) != LIBUSB_SUCCESS) {
+			upsdebugx(NUT_USB_DBG_DEVICE, "%s: can't set USB configuration #%d on device (%s).", __func__, configuration, libusb_strerror(ret));
+			if (ret == LIBUSB_ERROR_NO_MEM)
+				goto oom_error;
+			goto next_device;
+		} else {
+			upsdebugx(NUT_USB_DBG_DEVICE, "%s: successfully set USB configuration #%d on device.", __func__, configuration);
+		}
+
+		/* Now that we have matched (and configured) the device we wanted, claim it. */
 		ret = nut_usb_claim_interface(udev);
 		if (ret != LIBUSB_SUCCESS) {
-			libusb_free_device_list(devlist, 1);
+			nut_usb_free_devlist();
 			fatalx(EXIT_FAILURE, "Can't claim USB device %04x:%04x (%s).", curDevice->VendorID, curDevice->ProductID, libusb_strerror(ret));
 		}
 	/*	if_claimed = 1;	*/
 		upsdebugx(NUT_USB_DBG_DEVICE, "%s: claimed interface %d successfully.", __func__, nut_usb_if_num);
 
 		/* Set the USB alternate setting for the interface, if needed. */
-		nut_usb_set_altinterface(udev);
+		ret = nut_usb_set_altinterface(udev);
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			goto oom_error;
 
 		/* Done, if no callback is provided */
 		if (!callback) {
-			libusb_free_device_list(devlist, 1);
+			nut_usb_free_devlist();
 			return LIBUSB_SUCCESS;
 		}
 
@@ -450,6 +516,8 @@ static int	nut_libusb_open(
 			sizeof(hid_desc_buf),
 			USB_TIMEOUT
 		);
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			goto oom_error;
 		if (ret < 0) {
 			upsdebugx(NUT_USB_DBG_DEVICE, "%s: unable to get HID descriptor (%s).", __func__, libusb_strerror(ret));
 		} else if ((size_t)ret < sizeof(hid_desc_buf)) {
@@ -472,6 +540,8 @@ static int	nut_libusb_open(
 
 			/* For now, we always assume configuration 0, interface 0, altsetting 0. */
 			ret = libusb_get_config_descriptor(device, 0, &conf_desc);
+			if (ret == LIBUSB_ERROR_NO_MEM)
+				goto oom_error;
 			if (ret != LIBUSB_SUCCESS) {
 				upsdebugx(NUT_USB_DBG_DEVICE, "%s: unable to get the first configuration descriptor (%s).", __func__, libusb_strerror(ret));
 			} else {
@@ -536,6 +606,8 @@ static int	nut_libusb_open(
 			USB_TIMEOUT
 		);
 
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			goto oom_error;
 		if (ret < 0) {
 			upsdebugx(NUT_USB_DBG_DEVICE, "%s: unable to get REPORT descriptor (%s).", __func__, libusb_strerror(ret));
 			goto next_device;
@@ -556,7 +628,7 @@ static int	nut_libusb_open(
 
 		upsdebugx(NUT_USB_DBG_DEVICE, "%s: HID device found.", __func__);
 		fflush(stdout);
-		libusb_free_device_list(devlist, 1);
+		nut_usb_free_devlist();
 
 		return LIBUSB_SUCCESS;
 
@@ -568,14 +640,14 @@ static int	nut_libusb_open(
 		continue;
 
 	oom_error:
-		libusb_free_device_list(devlist, 1);
-		fatal_with_errno(EXIT_FAILURE, "Out of memory");
+		nut_usb_free_devlist();
+		fatalx(EXIT_FAILURE, "Out of memory.");
 
 	}
 
 	*udevp = NULL;
-	libusb_free_device_list(devlist, 1);
-	upsdebugx(NUT_USB_DBG_DEVICE, "%s: no appropriate HID device found.", __func__);
+	nut_usb_free_devlist();
+	upsdebugx(NUT_USB_DBG_DEVICE, "%s: no appropriate USB device found.", __func__);
 	fflush(stdout);
 
 	return LIBUSB_ERROR_NOT_FOUND;

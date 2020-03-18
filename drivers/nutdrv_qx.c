@@ -34,7 +34,7 @@
  *
  */
 
-#define DRIVER_VERSION	"0.36"
+#define DRIVER_VERSION	"0.39"
 
 #include "bool.h"
 #include "main.h"
@@ -583,8 +583,11 @@ static int	phoenix_command(const char *cmd, char *buf, size_t buflen)
 			continue;
 		}
 
-		if (ret == LIBUSB_ERROR_PIPE)
-			libusb_clear_halt(udev, LIBUSB_ENDPOINT_IN | 1);
+		if (ret == LIBUSB_ERROR_NO_MEM)
+			return ret;
+
+		if (ret == LIBUSB_ERROR_PIPE && libusb_clear_halt(udev, LIBUSB_ENDPOINT_IN | 1) == LIBUSB_ERROR_NO_MEM)
+			return LIBUSB_ERROR_NO_MEM;
 
 		upsdebugx(3, "flush: %s (%d)", libusb_strerror(ret), ret);
 		break;
@@ -2026,7 +2029,7 @@ void	upsdrv_initups(void)
 		/* Initialise the communication subdriver */
 		usb->init();
 
-		ret = usb->open(&udev, &usbdevice, regex_matcher, NULL);
+		ret = usb->open(&udev, &usbdevice, regex_matcher, COMM_CONFIG_SKIP, NULL);
 		if (ret != LIBUSB_SUCCESS) {
 			fatalx(EXIT_FAILURE,
 				"No supported devices found. Please check your device availability with 'lsusb'\n"
@@ -2064,6 +2067,8 @@ void	upsdrv_initups(void)
 			 *   See USB 2.0 specification, section 9.6.7, for more information on this.
 			 * This should allow automatic application of the workaround */
 			ret = libusb_get_string_descriptor(udev, 0, 0, tbuf, sizeof(tbuf));
+			if (ret == LIBUSB_ERROR_NO_MEM)
+				fatalx(EXIT_FAILURE, "Out of memory.");
 			if (ret >= 4) {
 				langid = tbuf[2] | (tbuf[3] << 8);
 				upsdebugx(1, "First supported language ID: 0x%x (please report to the NUT maintainer!)", langid);
@@ -2153,7 +2158,7 @@ static int	qx_command(const char *cmd, char *buf, size_t buflen)
 	#endif	/* QX_SERIAL */
 
 		if (udev == NULL) {
-			ret = usb->open(&udev, &usbdevice, reopen_matcher, NULL);
+			ret = usb->open(&udev, &usbdevice, reopen_matcher, COMM_CONFIG_SKIP, NULL);
 			if (ret != LIBUSB_SUCCESS)
 				return ret;
 		}
@@ -2169,12 +2174,17 @@ static int	qx_command(const char *cmd, char *buf, size_t buflen)
 		case LIBUSB_ERROR_BUSY:
 			fatalx(EXIT_FAILURE, "Got disconnected by another driver (%s).", libusb_strerror(ret));
 		case LIBUSB_ERROR_PIPE:
-			if (libusb_clear_halt(udev, LIBUSB_ENDPOINT_IN | 1) == LIBUSB_SUCCESS) {
+			if ((ret = libusb_clear_halt(udev, LIBUSB_ENDPOINT_IN | 1)) == LIBUSB_SUCCESS) {
 				upsdebugx(1, "Stall condition cleared");
 				break;
 			}
-			if (libusb_reset_device(udev) == LIBUSB_SUCCESS)
+			/* FALLTHRU */
+		case LIBUSB_ERROR_NO_MEM:
+			if (ret == LIBUSB_ERROR_NO_MEM || (ret = libusb_reset_device(udev)) == LIBUSB_ERROR_NO_MEM)
+				fatalx(EXIT_FAILURE, "Out of memory.");
+			if (ret == LIBUSB_SUCCESS)
 				upsdebugx(1, "Device reset handled");
+			/* FALLTHRU */
 		case LIBUSB_ERROR_NO_DEVICE:
 		case LIBUSB_ERROR_ACCESS:
 		case LIBUSB_ERROR_IO:
